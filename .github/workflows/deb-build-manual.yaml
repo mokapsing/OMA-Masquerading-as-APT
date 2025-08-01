@@ -59,7 +59,30 @@ jobs:
           cd src/oma
 
           # 修改 main.rs 中静态 UA 定义
-          sed -i 's/static APP_USER_AGENT: &str = concat!("oma\/", env!("CARGO_PKG_VERSION"));/static APP_USER_AGENT: &str = concat!("Debian APT-HTTP\/", env!("CARGO_PKG_VERSION"));/g' src/main.rs
+          FILE="src/main.rs"
+
+          # 创建临时文件
+          TMP_FILE=$(mktemp)
+
+          # 使用awk进行精确替换
+          awk '
+              /static APP_USER_AGENT: &str = concat!\("oma\/", env!\("CARGO_PKG_VERSION"\)\);/ {
+                  sub(/oma\//, "Debian APT-HTTP/")
+                  replaced = 1
+              }
+              { print }
+          ' "$FILE" > "$TMP_FILE"
+
+          # 检查是否成功替换
+          if grep -q 'Debian APT-HTTP' "$TMP_FILE"; then
+              mv "$TMP_FILE" "$FILE"
+              echo "成功修改了 $FILE"
+              exit 0
+          else
+              echo "错误: 未找到目标行或替换失败" >&2
+              rm -f "$TMP_FILE"
+              exit 1
+          fi
 
           # 更精确地替换 .user_agent("oma")，避免误伤变量名或其它字符串
           find . -name "*.rs" -exec sed -i 's/\.user_agent("oma")/.user_agent("Debian APT-HTTP")/g' {} +
