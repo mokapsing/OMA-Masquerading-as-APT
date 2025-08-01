@@ -1,0 +1,141 @@
+name: deb-build-manual
+
+on:
+  push:
+    branches: [ "*" ]
+  schedule:
+    - cron: '0 23 * * *'
+    - cron: '0 4 * * *'
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          [
+            "debian:12",
+            "debian:trixie",
+          ]
+    container:
+      image: "${{ matrix.target }}"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive  # ✅ 拉取 submodule
+
+      - name: Update oma submodule to latest master
+        shell: bash
+        run: |
+          cd src/oma
+          git fetch origin master
+          git checkout origin/master
+
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          apt-get update
+          env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential pkgconf nettle-dev libapt-pkg-dev curl \
+            xz-utils clang openssh-client rsync libbz2-dev liblzma-dev \
+            libzstd-dev jq
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: "${{ matrix.target }}"
+
+      - name: Install cargo-deb
+        run: cargo install -f cargo-deb
+
+      - name: Patch source User-Agent string and version
+        shell: bash
+        run: |
+          cd src/oma
+
+          # 修改 main.rs 中静态 UA 定义
+          sed -i 's/static APP_USER_AGENT: &str = concat!("oma\/", env!("CARGO_PKG_VERSION"));/static APP_USER_AGENT: &str = concat!("Debian APT-HTTP\/", env!("CARGO_PKG_VERSION"));/g' src/main.rs
+
+          # 更精确地替换 .user_agent("oma")，避免误伤变量名或其它字符串
+          find . -name "*.rs" -exec sed -i 's/\.user_agent("oma")/.user_agent("Debian APT-HTTP")/g' {} +
+
+          # 秒级时间戳追加到 Cargo.toml 的 version 字段
+          TS=$(date +%s)
+          sed -i -E "s/^(version\s*=\s*\")([0-9a-zA-Z\.\-\+]+)(\")/\1\2.${TS}\3/" Cargo.toml
+
+      - name: Build deb package
+        shell: bash
+        run: |
+          cd src/oma
+
+          export ZSTD_SYS_USE_PKG_CONFIG=1
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+          just
+
+          VER_SUFFIX="${TARGET_DISTRO/:/}"
+          VER_SUFFIX="${VER_SUFFIX##*\/}"
+
+          case "${TARGET_DISTRO}" in
+              'debian:11')
+                  CODENAME='bullseye'
+                  ;;
+              'debian:12')
+                  CODENAME='bookworm'
+                  ;;
+              'debian:trixie')
+                  CODENAME='trixie'
+                  VER_SUFFIX='debian13'
+                  ;;
+              'ubuntu:20.04')
+                  CODENAME='focal'
+                  ;;
+              'ubuntu:22.04')
+                  CODENAME='jammy'
+                  ;;
+              'ubuntu:24.04')
+                  CODENAME='noble'
+                  ;;
+              'linuxdeepin/deepin')
+                  CODENAME='beige'
+                  VER_SUFFIX="${VER_SUFFIX}23"
+                  ;;
+              'chenchongbiao/openkylin')
+                  CODENAME='nile'
+                  VER_SUFFIX="${VER_SUFFIX}2.0"
+                  ;;
+          esac
+
+          for i in target/debian/*.deb; do
+            mv -v "${i}" "${i/\.deb/-$VER_SUFFIX.deb}"
+          done
+
+          echo "VER_SUFFIX=${VER_SUFFIX}" >> "${GITHUB_ENV}"
+          echo "CODENAME=${CODENAME}" >> "${GITHUB_ENV}"
+        env:
+          TARGET_DISTRO: "${{ matrix.target }}"
+
+      - name: Upload packages (GitHub Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.VER_SUFFIX }}
+          path: "src/oma/target/debian/*.deb"
+
+      - name: Get latest release tag
+        id: get_tag
+        run: |
+          tag=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to latest release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          files: |
+            src/oma/target/debian/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
