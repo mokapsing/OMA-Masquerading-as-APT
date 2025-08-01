@@ -1,0 +1,166 @@
+name: deb-build-manual
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "*" ]
+  schedule:
+    - cron: '0 23 * * *'
+    - cron: '0 4 * * *'
+
+jobs:
+  clean-release-assets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete all .deb assets in 'latest' release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          repo="${{ github.repository }}"
+          api="https://api.github.com/repos/$repo"
+          release_id=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$api/releases/tags/latest" | jq -r .id)
+
+          if [ "$release_id" = "null" ]; then
+            echo "Release 'latest' not found. Skipping."
+            exit 0
+          fi
+
+          curl -s -H "Authorization: token $GITHUB_TOKEN" "$api/releases/$release_id/assets" \
+          | jq -r '.[] | select(.name | endswith(".deb")) | .id' \
+          | xargs -r -I{} curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" "$api/releases/assets/{}"
+
+  generate-timestamp:
+    runs-on: ubuntu-latest
+    outputs:
+      timestamp: ${{ steps.set-timestamp.outputs.timestamp }}
+    steps:
+      - id: set-timestamp
+        run: echo "timestamp=$(date +%s)" >> $GITHUB_OUTPUT
+
+  package:
+    needs:
+      - clean-release-assets
+      - generate-timestamp
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - "debian:12"
+          - "debian:trixie"
+    container:
+      image: "${{ matrix.target }}"
+    env:
+      TIMESTAMP: ${{ needs.generate-timestamp.outputs.timestamp }}
+      TARGET_DISTRO: "${{ matrix.target }}"
+    steps:
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          apt-get update
+          env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential pkgconf nettle-dev libapt-pkg-dev curl \
+            xz-utils clang openssh-client rsync libbz2-dev liblzma-dev \
+            libzstd-dev jq git
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Update oma submodule to latest master
+        shell: bash
+        run: |
+          cd src/oma
+          git fetch origin master
+          git checkout origin/master
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: "${{ matrix.target }}"
+
+      - name: Install cargo-deb
+        run: cargo install -f cargo-deb
+
+      - name: Patch source User-Agent string and version
+        shell: bash
+        run: |
+          cd src/oma
+
+          # 用同一时间戳修改 Cargo.toml 版本号
+          sed -i -E "/^version = \"/s/(\"[0-9]+\.[0-9]+\.[^\"]*)\"/\1.${TIMESTAMP}\"/" Cargo.toml
+
+          FILE="src/main.rs"
+          TMP_FILE=$(mktemp)
+
+          awk '
+              /static APP_USER_AGENT: &str = concat!\("oma\/", env!\("CARGO_PKG_VERSION"\)\);/ {
+                  sub(/oma\//, "Debian APT-HTTP/")
+              }
+              { print }
+          ' "$FILE" > "$TMP_FILE"
+
+          if grep -q 'Debian APT-HTTP' "$TMP_FILE"; then
+              mv "$TMP_FILE" "$FILE"
+              echo "成功修改了 $FILE"
+          else
+              echo "错误: 未找到目标行或替换失败" >&2
+              rm -f "$TMP_FILE"
+              exit 1
+          fi
+
+          find . -name "*.rs" -exec sed -i 's/\.user_agent("oma")/.user_agent("Debian APT-HTTP")/g' {} +
+
+      - name: Build deb package
+        shell: bash
+        run: |
+          cd src/oma
+
+          export ZSTD_SYS_USE_PKG_CONFIG=1
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+          just
+
+          VER_SUFFIX="${TARGET_DISTRO/:/}"
+          VER_SUFFIX="${VER_SUFFIX##*\/}"
+
+          case "${TARGET_DISTRO}" in
+              'debian:11') CODENAME='bullseye' ;;
+              'debian:12') CODENAME='bookworm' ;;
+              'debian:trixie') CODENAME='trixie'; VER_SUFFIX='debian13' ;;
+              'ubuntu:20.04') CODENAME='focal' ;;
+              'ubuntu:22.04') CODENAME='jammy' ;;
+              'ubuntu:24.04') CODENAME='noble' ;;
+              'linuxdeepin/deepin') CODENAME='beige'; VER_SUFFIX="${VER_SUFFIX}23" ;;
+              'chenchongbiao/openkylin') CODENAME='nile'; VER_SUFFIX="${VER_SUFFIX}2.0" ;;
+          esac
+
+          shopt -s nullglob
+          dpkg-name target/debian/*.deb || true
+          for i in target/debian/*.deb; do
+            mv -v "${i}" "${i/\.deb/-$VER_SUFFIX.deb}"
+          done
+          shopt -u nullglob
+
+          echo "VER_SUFFIX=${VER_SUFFIX}" >> "${GITHUB_ENV}"
+          echo "CODENAME=${CODENAME}" >> "${GITHUB_ENV}"
+
+      - name: Upload packages (GitHub Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.VER_SUFFIX }}
+          path: "src/oma/target/debian/*.deb"
+
+      - name: Upload to latest release
+        uses: softprops/action-gh-release@v1
+        continue-on-error: true
+        with:
+          tag_name: latest
+          files: |
+            src/oma/target/debian/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

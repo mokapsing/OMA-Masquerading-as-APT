@@ -1,0 +1,3 @@
+[submodule "src/oma"]
+	path = src/oma
+	url = https://github.com/AOSC-Dev/oma
