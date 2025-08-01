@@ -20,6 +20,15 @@ jobs:
     container:
       image: "${{ matrix.target }}"
     steps:
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          apt-get update
+          env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential pkgconf nettle-dev libapt-pkg-dev curl \
+            xz-utils clang openssh-client rsync libbz2-dev liblzma-dev \
+            libzstd-dev jq git
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -31,15 +40,6 @@ jobs:
           cd src/oma
           git fetch origin master
           git checkout origin/master
-
-      - name: Install Dependencies
-        shell: bash
-        run: |
-          apt-get update
-          env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            build-essential pkgconf nettle-dev libapt-pkg-dev curl \
-            xz-utils clang openssh-client rsync libbz2-dev liblzma-dev \
-            libzstd-dev jq
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
